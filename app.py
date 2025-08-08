@@ -7,18 +7,31 @@ import time
 import PyPDF2
 import docx
 from io import BytesIO
+import spacy
+import pandas as pd
+import plotly.express as px
 
 # --- AI Model and API Configuration ---
-# Read the API key from the environment variable
 genai.configure(api_key=os.environ.get('GOOGLE_API_KEY'))
 
 @st.cache_resource
-def load_model():
+def load_sentence_model():
     """Loads the SentenceTransformer model once and caches it."""
     return SentenceTransformer('all-MiniLM-L6-v2')
 
-# Load the model
-model = load_model()
+@st.cache_resource
+def load_spacy_model():
+    """Loads the spaCy model and caches it."""
+    try:
+        return spacy.load("en_core_web_sm")
+    except OSError:
+        print("Downloading spaCy model...")
+        spacy.cli.download("en_core_web_sm")
+        return spacy.load("en_core_web_sm")
+
+# Load models
+model = load_sentence_model()
+nlp = load_spacy_model()
 
 # --- Helper Functions ---
 def extract_text_from_file(uploaded_file):
@@ -27,7 +40,6 @@ def extract_text_from_file(uploaded_file):
         if uploaded_file.type == "text/plain":
             return uploaded_file.read().decode("utf-8")
         elif uploaded_file.type == "application/pdf":
-            # Use BytesIO to handle the in-memory file
             pdf_file = BytesIO(uploaded_file.getvalue())
             pdf_reader = PyPDF2.PdfReader(pdf_file)
             text = ""
@@ -42,20 +54,15 @@ def extract_text_from_file(uploaded_file):
             return text
     except Exception as e:
         st.error(f"Error reading file {uploaded_file.name}: {e}")
-        return None
     return None
 
 def cosine_similarity(a, b):
-    """Calculates the cosine similarity between two vectors."""
     dot_product = np.dot(a, b)
     norm_a = np.linalg.norm(a)
     norm_b = np.linalg.norm(b)
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot_product / (norm_a * norm_b)
+    return 0.0 if norm_a == 0 or norm_b == 0 else dot_product / (norm_a * norm_b)
 
 def get_gemini_summary(job_description, resume_text):
-    """Generates a concise summary using the Gemini API with exponential backoff."""
     prompt = (
         f"Based on the following job description and candidate resume, "
         f"write a concise summary (1-2 sentences) explaining why this candidate "
@@ -63,28 +70,24 @@ def get_gemini_summary(job_description, resume_text):
         f"Job Description:\\n{job_description}\\n\\n"
         f"Candidate Resume:\\n{resume_text}"
     )
-    retries = 3
-    delay = 2
-    for i in range(retries):
-        try:
-            generation_config = genai.types.GenerationConfig(temperature=0.7)
-            model_gemini = genai.GenerativeModel('gemini-1.5-flash', generation_config=generation_config)
-            response = model_gemini.generate_content(prompt)
-            if response and response.text:
-                return response.text
-            else:
-                return "Could not generate a summary from the API response."
-        except Exception as e:
-            if i < retries - 1:
-                time.sleep(delay)
-                delay *= 2  # Exponential backoff
-            else:
-                return f"Error generating summary after multiple retries: {str(e)}"
-    return "Error: Could not generate summary."
+    try:
+        model_gemini = genai.GenerativeModel('gemini-1.5-flash')
+        response = model_gemini.generate_content(prompt)
+        return response.text or "Could not generate a summary from the API response."
+    except Exception as e:
+        return f"Error generating summary: {str(e)}"
 
+def extract_keywords(text):
+    """Extracts nouns and proper nouns as keywords, filtering for actual words."""
+    doc = nlp(text.lower())
+    keywords = {
+        token.text for token in doc 
+        if token.pos_ in ['NOUN', 'PROPN'] and token.is_alpha and len(token.text) > 1
+    }
+    return keywords
 
 # --- Streamlit UI ---
-st.set_page_config(page_title="Candidate Recommender", page_icon="🔍", layout="wide")
+st.set_page_config(page_title="Resu-Meter", page_icon="🎯", layout="wide")
 
 st.markdown("""
     <style>
@@ -93,8 +96,8 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<p class="big-font">Resu-Meter : A Candidate Recommendation Engine</p>', unsafe_allow_html=True)
-st.write("Hi Recruiter! Find the best candidates by uploading resumes or pasting text. The engine will rank them based on relevance to the job description.")
+st.markdown('<p class="big-font">Resu-Meter: A Candidate Recommendation Engine</p>', unsafe_allow_html=True)
+st.write("Hi Recruiter! Find the best candidates by uploading resumes or pasting text. The engine will rank them and highlight key skills.")
 
 with st.form("recommendation_form"):
     st.subheader("1. Job Description")
@@ -105,44 +108,39 @@ with st.form("recommendation_form"):
 
     with tab1:
         uploaded_files = st.file_uploader(
-            "Choose resume files (accepted formats : .pdf, .docx, .txt)",
+            "Choose resume files (accepted formats: .pdf, .docx, .txt)",
             accept_multiple_files=True,
             type=['pdf', 'docx', 'txt']
         )
-
     with tab2:
         if 'candidates' not in st.session_state:
-            st.session_state.candidates = [{'name': '', 'resume': ''}, {'name': '', 'resume': ''}]
-
+            st.session_state.candidates = [{'name': '', 'resume': ''}]
         for i, candidate in enumerate(st.session_state.candidates):
-            st.text_input(f"Candidate Name or Candidate ID", key=f"name_{i}", placeholder=f"Candidate {i+1} Name")
+            st.text_input(f"Candidate Name or ID", key=f"name_{i}", placeholder=f"Candidate {i+1} Name")
             st.text_area(f"Resume Text", height=150, key=f"resume_{i}", placeholder="Please paste resume text here...")
-            st.markdown("---")
 
-    submit_button = st.form_submit_button("✨ Generate Recommendations")
+    submit_button = st.form_submit_button("🧑‍💼👍📄 Generate Recommendations")
 
 # --- Recommendation Logic ---
 if submit_button:
     all_candidates = []
-
-    # 1. Process uploaded files
     if uploaded_files:
         for uploaded_file in uploaded_files:
             resume_text = extract_text_from_file(uploaded_file)
             if resume_text:
                 all_candidates.append({'name': uploaded_file.name, 'resume': resume_text})
 
-    # 2. Process manually pasted resumes
     pasted_candidates = [{'name': st.session_state[f'name_{i}'], 'resume': st.session_state[f'resume_{i}']} for i in range(len(st.session_state.candidates))]
     valid_pasted_candidates = [c for c in pasted_candidates if c['name'] and c['resume']]
     all_candidates.extend(valid_pasted_candidates)
 
     if not job_description or not all_candidates:
-        st.error("❗ Please provide a job description and at least one resume (either uploaded or pasted).")
+        st.error("❗ Please provide a job description and at least one resume.")
     else:
-        st.subheader("🏆 Top Candidate Recommendations")
-        with st.spinner('Analyzing resumes and generating recommendations... This may take a moment.'):
+        st.subheader("🏆🎉 Top Candidate Recommendations")
+        with st.spinner('Analyzing resumes, generating recommendations, and building visualizations...'):
             job_embedding = model.encode(job_description)
+            job_keywords = extract_keywords(job_description)
             recommendations = []
 
             for candidate in all_candidates:
@@ -155,14 +153,29 @@ if submit_button:
                 })
 
             recommendations.sort(key=lambda x: x['similarity'], reverse=True)
-            top_recommendations = recommendations[:10] # Display top 10
+            top_recommendations = recommendations[:10]
+
+            # --- Visualization Part ---
+            df = pd.DataFrame(top_recommendations)
+            if not df.empty:
+                fig = px.bar(df, x='similarity', y='name', orientation='h', title='Top Candidate Scores',
+                             text='similarity', labels={'similarity': 'Relevance Score', 'name': 'Candidate'})
+                fig.update_layout(yaxis={'categoryorder':'total ascending'}, uniformtext_minsize=8, uniformtext_mode='hide')
+                fig.update_traces(texttemplate='%{text:.2%}', textposition='outside')
+                st.plotly_chart(fig, use_container_width=True)
 
         st.success("🎉 Recommendations generated!")
         for i, rec in enumerate(top_recommendations):
             st.markdown(f"### **{i+1}. {rec['name']}**")
             st.progress(rec['similarity'], text=f"**Relevance Score: {rec['similarity']:.2%}**")
 
-            with st.expander("🤖 Show AI-Generated Summary"):
+            # --- Keyword Matching Part ---
+            resume_keywords = extract_keywords(rec['resume'])
+            matched_keywords = job_keywords.intersection(resume_keywords)
+            if matched_keywords:
+                st.markdown(f"**🔑 Matched Keywords:** `{'`, `'.join(sorted(list(matched_keywords)))}`")
+
+            with st.expander("💡 Show AI-Generated Summary"):
                 with st.spinner('Generating summary...'):
                     summary = get_gemini_summary(job_description, rec['resume'])
                     st.write(summary)
